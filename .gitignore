@@ -1,0 +1,27 @@
+# Dependencies
+node_modules/
+
+# Hardhat
+artifacts/
+cache/
+typechain-types/
+
+# Environment
+.env
+.env.local
+
+# Deployments (optional — may want to track these)
+# deployments/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Python
+__pycache__/
+*.pyc
+.venv/

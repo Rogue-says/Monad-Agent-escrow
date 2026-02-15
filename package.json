@@ -1,0 +1,43 @@
+{
+  "name": "monad-escrow-marketplace",
+  "version": "1.0.0",
+  "description": "EVM-compatible agent escrow marketplace on Monad blockchain",
+  "main": "index.js",
+  "scripts": {
+    "compile": "hardhat compile",
+    "test": "hardhat test",
+    "deploy:testnet": "hardhat run scripts/deploy.js --network monadTestnet",
+    "deploy:mainnet": "hardhat run scripts/deploy.js --network monadMainnet",
+    "deploy:local": "hardhat run scripts/deploy.js --network hardhat",
+    "verify": "hardhat verify",
+    "clean": "hardhat clean",
+    "node": "hardhat node",
+    "accounts": "hardhat accounts",
+    "gas-reporter": "REPORT_GAS=true hardhat test"
+  },
+  "keywords": [
+    "monad",
+    "escrow",
+    "blockchain",
+    "ethereum",
+    "solidity",
+    "agent",
+    "marketplace"
+  ],
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "@nomicfoundation/hardhat-toolbox": "^4.0.0",
+    "hardhat": "^2.19.0",
+    "dotenv": "^16.3.1",
+    "chai": "^4.3.7",
+    "ethers": "^6.9.0"
+  },
+  "dependencies": {
+    "@openzeppelin/contracts": "^5.0.0"
+  },
+  "optionalDependencies": {
+    "hardhat-gas-reporter": "^1.0.9",
+    "solidity-coverage": "^0.8.5"
+  }
+}
