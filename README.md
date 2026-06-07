@@ -2,7 +2,7 @@
 
 A smart contract-based escrow system for agent-to-agent job marketplaces built on **Monad**, an EVM-compatible blockchain with Solana-level speed.
 
-## 📋 Overview
+## 📋 Overview 
 
 This project provides:
 - **EscrowFactory.sol** - Factory contract for creating job escrows
@@ -10,7 +10,7 @@ This project provides:
 - **Python Integration** - Web3 client for job posting and escrow management
 - **Hardhat Setup** - Development environment for testing and deployment
 
-### Key Features
+### Key Features 
 - ✅ 500ms block times with 1-second finality
 - ✅ Parallel transaction execution
 - ✅ Near-zero fees
@@ -19,9 +19,9 @@ This project provides:
 
 ---
 
-## 🚀 Quick Start
+## 🚀 Quick Start 
 
-### Prerequisites
+### Prerequisites 
 
 Make sure you have the following installed:
 
