@@ -1,303 +1,163 @@
 #!/usr/bin/env python3
-"""
-Monad Escrow Integration Script for OpenClaw Skill
-Handles job posting and escrow management on Monad Testnet
-"""
-
-import os
+"""Synchronous escrow client. One process per signing account; amounts are decimal strings."""
+import argparse
 import json
-import time
-from typing import Dict, Optional, Tuple
+import os
+from decimal import Decimal, InvalidOperation
+from pathlib import Path
+from threading import Lock
 from web3 import Web3
 from eth_account import Account
-from eth_account.signers.local import LocalAccount
 from dotenv import load_dotenv
 
-# Load environment variables
-load_dotenv()
+ROOT = Path(__file__).resolve().parent
+load_dotenv(ROOT / '.env')
+
+
+def load_abi(name):
+    path = ROOT / 'artifacts' / 'contracts' / f'{name}.sol' / f'{name}.json'
+    if not path.exists():
+        raise FileNotFoundError('Contract artifacts missing. Run npm run compile first.')
+    return json.loads(path.read_text())['abi']
+
+
+def amount_to_wei(value):
+    try:
+        amount = Decimal(str(value)) * Decimal(10**18)
+        if not amount.is_finite() or amount <= 0 or amount != amount.to_integral_value():
+            raise ValueError('Amount must be positive with at most 18 decimal places')
+        return int(amount)
+    except InvalidOperation as exc:
+        raise ValueError('Invalid MON amount') from exc
+
 
 class MonadEscrowClient:
-    """Client for interacting with Monad escrow contracts"""
-    
-    def __init__(self, private_key: str, rpc_url: str = "https://testnet-rpc.monad.xyz/"):
-        """
-        Initialize Monad Escrow Client
-        
-        Args:
-            private_key: Private key of the account
-            rpc_url: RPC endpoint URL (defaults to Monad testnet)
-        """
-        self.w3 = Web3(Web3.HTTPProvider(rpc_url))
-        
-        # Verify connection
+    def __init__(self, private_key, rpc_url=None, chain_id=None):
+        self.w3 = Web3(Web3.HTTPProvider(rpc_url or os.getenv('RPC_URL', 'https://testnet-rpc.monad.xyz'),
+                                       request_kwargs={'timeout': 30}))
         if not self.w3.is_connected():
-            raise ConnectionError(f"Failed to connect to {rpc_url}")
-        
-        # Setup account
-        self.account: LocalAccount = Account.from_key(private_key)
+            raise ConnectionError('RPC is unavailable')
+        self.chain_id = int(chain_id if chain_id is not None else os.getenv('CHAIN_ID', '10143'))
+        if self.w3.eth.chain_id != self.chain_id:
+            raise ValueError('RPC chain ID does not match the expected chain')
+        self.account = Account.from_key(private_key)
         self.address = self.account.address
-        
-        # Network configuration
-        self.chain_id = 10143  # Monad testnet
-        self.gas_price = 52000000000  # 52 gwei
-        
-        # Contract ABI (simplified - use full ABI in production)
-        self.escrow_factory_abi = json.loads('''[
-            {
-                "inputs": [
-                    {"internalType": "uint256", "name": "jobId", "type": "uint256"},
-                    {"internalType": "address", "name": "_worker", "type": "address"},
-                    {"internalType": "uint256", "name": "_amount", "type": "uint256"}
-                ],
-                "name": "createEscrow",
-                "outputs": [{"internalType": "address", "name": "", "type": "address"}],
-                "stateMutability": "payable",
-                "type": "function"
-            },
-            {
-                "inputs": [{"internalType": "uint256", "name": "jobId", "type": "uint256"}],
-                "name": "getEscrow",
-                "outputs": [{"internalType": "address", "name": "", "type": "address"}],
-                "stateMutability": "view",
-                "type": "function"
-            },
-            {
-                "inputs": [],
-                "name": "getEscrowCount",
-                "outputs": [{"internalType": "uint256", "name": "", "type": "uint256"}],
-                "stateMutability": "view",
-                "type": "function"
-            },
-            {
-                "anonymous": false,
-                "inputs": [
-                    {"indexed": true, "internalType": "uint256", "name": "jobId", "type": "uint256"},
-                    {"indexed": true, "internalType": "address", "name": "escrowAddress", "type": "address"},
-                    {"indexed": true, "internalType": "address", "name": "creator", "type": "address"},
-                    {"indexed": false, "internalType": "uint256", "name": "amount", "type": "uint256"}
-                ],
-                "name": "EscrowCreated",
-                "type": "event"
-            }
-        ]''')
-        
+        self.escrow_factory_abi = load_abi('EscrowFactory')
+        self.job_abi = load_abi('JobEscrow')
         self.escrow_factory_address = None
-        
-    def set_factory_address(self, address: str) -> None:
-        """Set the EscrowFactory contract address"""
-        if not Web3.is_address(address):
-            raise ValueError(f"Invalid contract address: {address}")
-        self.escrow_factory_address = Web3.to_checksum_address(address)
-    
-    def get_balance(self) -> str:
-        """Get account balance in MON"""
-        balance_wei = self.w3.eth.get_balance(self.address)
-        balance_mon = self.w3.from_wei(balance_wei, "ether")
-        return str(balance_mon)
-    
-    def post_job(
-        self,
-        job_id: int,
-        worker_address: str,
-        budget_in_mon: float,
-        job_data: Optional[Dict] = None
-    ) -> Dict:
-        """
-        Post a job and create an escrow contract
-        
-        Args:
-            job_id: Unique job identifier
-            worker_address: Address of the worker
-            budget_in_mon: Budget in MON tokens
-            job_data: Additional job metadata (optional)
-        
-        Returns:
-            Dictionary with transaction hash and escrow address
-        """
+        self._lock = Lock()
+
+    def set_factory_address(self, address):
+        address = Web3.to_checksum_address(address)
+        if not self.w3.eth.get_code(address):
+            raise ValueError('No factory contract code at this address')
+        self.escrow_factory_address = address
+
+    def _factory(self):
         if self.escrow_factory_address is None:
-            raise ValueError("EscrowFactory address not set")
-        
-        if not Web3.is_address(worker_address):
-            raise ValueError(f"Invalid worker address: {worker_address}")
-        
-        if budget_in_mon <= 0:
-            raise ValueError("Budget must be greater than 0")
-        
-        # Convert MON to wei
-        amount_wei = self.w3.to_wei(budget_in_mon, "ether")
-        worker_address = Web3.to_checksum_address(worker_address)
-        
-        try:
-            # Get factory contract
-            factory = self.w3.eth.contract(
-                address=self.escrow_factory_address,
-                abi=self.escrow_factory_abi
-            )
-            
-            # Build transaction
-            print(f"📝 Building transaction for job {job_id}...")
-            print(f"   Worker: {worker_address}")
-            print(f"   Budget: {budget_in_mon} MON")
-            
-            txn = factory.functions.createEscrow(
-                job_id,
-                worker_address,
-                amount_wei
-            ).build_transaction({
-                'from': self.address,
-                'value': amount_wei,
-                'gas': 300000,
-                'gasPrice': self.gas_price,
-                'nonce': self.w3.eth.get_transaction_count(self.address),
-                'chainId': self.chain_id
-            })
-            
-            # Sign transaction
-            print("🔏 Signing transaction...")
-            signed_txn = self.account.sign_transaction(txn)
-            
-            # Send transaction
-            print("📤 Sending transaction to Monad...")
-            tx_hash = self.w3.eth.send_raw_transaction(signed_txn.raw_transaction)
-            tx_hash_hex = tx_hash.hex()
-            
-            print(f"✅ Transaction sent: {tx_hash_hex}")
-            
-            # Wait for receipt
-            print("⏳ Waiting for confirmation...")
-            receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=30)
-            
-            if receipt['status'] == 1:
-                print(f"✔️ Transaction confirmed in block {receipt['blockNumber']}")
-                
-                # Get escrow address from logs
-                escrow_address = self._extract_escrow_address_from_receipt(receipt, factory)
-                
-                result = {
-                    "status": "success",
-                    "job_id": job_id,
-                    "tx_hash": tx_hash_hex,
-                    "block_number": receipt['blockNumber'],
-                    "gas_used": receipt['gasUsed'],
-                    "escrow_address": escrow_address,
-                    "job_data": job_data or {}
-                }
-                
-                print(f"🎉 Escrow created at: {escrow_address}")
-                return result
-            else:
-                raise Exception("Transaction failed")
-            
-        except Exception as e:
-            print(f"❌ Error posting job: {str(e)}")
-            raise
-    
-    def get_escrow_address(self, job_id: int) -> Optional[str]:
-        """Get escrow contract address for a job"""
-        if self.escrow_factory_address is None:
-            raise ValueError("EscrowFactory address not set")
-        
-        try:
-            factory = self.w3.eth.contract(
-                address=self.escrow_factory_address,
-                abi=self.escrow_factory_abi
-            )
-            
-            escrow_address = factory.functions.getEscrow(job_id).call()
-            
-            if escrow_address == "0x0000000000000000000000000000000000000000":
-                return None
-            
-            return escrow_address
-        
-        except Exception as e:
-            print(f"❌ Error getting escrow: {str(e)}")
-            return None
-    
-    def get_factory_escrow_count(self) -> int:
-        """Get total number of escrows created"""
-        if self.escrow_factory_address is None:
-            raise ValueError("EscrowFactory address not set")
-        
-        try:
-            factory = self.w3.eth.contract(
-                address=self.escrow_factory_address,
-                abi=self.escrow_factory_abi
-            )
-            
-            count = factory.functions.getEscrowCount().call()
-            return int(count)
-        
-        except Exception as e:
-            print(f"❌ Error getting escrow count: {str(e)}")
-            return 0
-    
-    def _extract_escrow_address_from_receipt(self, receipt, factory):
-        """Extract escrow address from transaction receipt logs"""
-        try:
-            # Decode logs to find EscrowCreated event
-            logs = factory.events.EscrowCreated().process_receipt(receipt)
-            if logs:
-                return logs[0]['args']['escrowAddress']
-        except Exception as e:
-            print(f"Warning: Could not extract escrow from logs: {str(e)}")
-        
-        return None
+            raise ValueError('EscrowFactory address not set')
+        return self.w3.eth.contract(address=self.escrow_factory_address, abi=self.escrow_factory_abi)
+
+    def _send(self, function, value=0):
+        # Serialize nonce assignment and confirmation for this client instance.
+        with self._lock:
+            fields = {'from': self.address, 'value': value, 'chainId': self.chain_id,
+                      'nonce': self.w3.eth.get_transaction_count(self.address, 'pending'),
+                      'gasPrice': self.w3.eth.gas_price}
+            fields['gas'] = (function.estimate_gas(fields) * 120 + 99) // 100
+            transaction = function.build_transaction(fields)
+            signed = self.account.sign_transaction(transaction)
+            tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
+            try:
+                receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+            except Exception as exc:
+                raise RuntimeError(f'Transaction broadcast: {tx_hash.hex()}; confirmation unknown. Check it before retrying.') from exc
+            if receipt['status'] != 1:
+                raise RuntimeError(f'Transaction reverted: {tx_hash.hex()}')
+            return receipt
+
+    def get_balance(self):
+        return str(self.w3.from_wei(self.w3.eth.get_balance(self.address), 'ether'))
+
+    def post_job(self, job_id, worker_address, budget_in_mon, job_data=None):
+        if isinstance(job_id, bool) or not isinstance(job_id, int) or not 0 <= job_id < 2**256:
+            raise ValueError('job_id must be a uint256 integer')
+        worker = Web3.to_checksum_address(worker_address)
+        amount = amount_to_wei(budget_in_mon)
+        factory = self._factory()
+        receipt = self._send(factory.functions.createEscrow(job_id, worker, amount), amount)
+        logs = factory.events.EscrowCreated().process_receipt(receipt)
+        if not logs:
+            raise RuntimeError('Confirmed transaction did not emit EscrowCreated')
+        return {'status': 'success', 'job_id': job_id, 'escrow_address': logs[0]['args']['escrowAddress'],
+                'tx_hash': receipt['transactionHash'].hex(), 'block_number': receipt['blockNumber'],
+                'gas_used': receipt['gasUsed'], 'job_data': job_data or {}}
+
+    def get_escrow_address(self, job_id):
+        address = self._factory().functions.getEscrow(job_id).call()
+        return None if int(address, 16) == 0 else address
+
+    def get_factory_escrow_count(self):
+        return self._factory().functions.getEscrowCount().call()
+
+    def _job(self, job_id):
+        address = self.get_escrow_address(job_id)
+        if address is None:
+            raise ValueError('Job does not exist')
+        return self.w3.eth.contract(address=address, abi=self.job_abi)
+
+    def get_job(self, job_id):
+        job = self._job(job_id)
+        fields = ['client', 'worker', 'arbitrator', 'amount', 'deadline', 'reviewDeadline',
+                  'released', 'beneficiary', 'withdrawable', 'getState']
+        return {'address': job.address, **{key: getattr(job.functions, key)().call() for key in fields}}
+
+    def act(self, job_id, action, recipient=None):
+        allowed = {'start': 'startWork', 'submit': 'submitWork', 'approve': 'approveWork',
+                   'dispute': 'raiseDispute', 'resolve': 'resolveDispute', 'release': 'autoRelease',
+                   'refund': 'refund', 'withdraw': 'withdraw'}
+        if action not in allowed:
+            raise ValueError('Unknown escrow action')
+        fn = getattr(self._job(job_id).functions, allowed[action])
+        if action in {'resolve', 'withdraw'}:
+            if not recipient:
+                raise ValueError('This action requires a recipient or dispute winner')
+            fn = fn(Web3.to_checksum_address(recipient))
+        else:
+            fn = fn()
+        receipt = self._send(fn)
+        return {'status': 'success', 'tx_hash': receipt['transactionHash'].hex()}
 
 
 def main():
-    """Example usage of MonadEscrowClient"""
-    
-    # Get credentials from environment
-    private_key = os.getenv("PRIVATE_KEY")
-    factory_address = os.getenv("ESCROW_FACTORY_ADDRESS")
-    
-    if not private_key:
-        print("❌ Error: PRIVATE_KEY not found in environment variables")
-        print("   Set it using: export PRIVATE_KEY=your_private_key")
-        return
-    
-    if not factory_address:
-        print("❌ Error: ESCROW_FACTORY_ADDRESS not found in environment variables")
-        print("   Set it using: export ESCROW_FACTORY_ADDRESS=0x...")
-        return
-    
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('action', choices=['balance', 'count', 'show', 'create', 'start', 'submit',
+                                          'approve', 'dispute', 'resolve', 'release', 'refund', 'withdraw'])
+    parser.add_argument('--job-id', type=int)
+    parser.add_argument('--worker')
+    parser.add_argument('--amount', help='MON as a decimal string')
+    parser.add_argument('--recipient', help='Withdrawal recipient or arbitration winner')
+    args = parser.parse_args()
+    if args.action not in {'balance', 'count'} and args.job_id is None:
+        parser.error('--job-id is required')
+    if args.action == 'create' and (not args.worker or not args.amount):
+        parser.error('create requires --worker and --amount')
     try:
-        # Initialize client
-        print("🔌 Connecting to Monad Testnet...")
-        client = MonadEscrowClient(private_key)
-        client.set_factory_address(factory_address)
-        
-        # Check balance
-        balance = client.get_balance()
-        print(f"💰 Account balance: {balance} MON")
-        
-        # Example: Post a job
-        print("\n📋 Creating a test job...")
-        job_id = int(time.time())
-        worker_address = "0x742d35Cc6634C0532925a3b844Bc0c6Ea17e3d6B"  # Replace with actual worker
-        budget = 0.1  # 0.1 MON
-        
-        result = client.post_job(
-            job_id=job_id,
-            worker_address=worker_address,
-            budget_in_mon=budget,
-            job_data={
-                "title": "Test Job",
-                "description": "A test job for Monad escrow"
-            }
-        )
-        
-        print("\n✅ Job posted successfully!")
+        if not os.getenv('PRIVATE_KEY'):
+            raise ValueError('PRIVATE_KEY is required')
+        client = MonadEscrowClient(os.environ['PRIVATE_KEY'])
+        if args.action == 'balance':
+            result = {'balance': client.get_balance()}
+        else:
+            client.set_factory_address(os.getenv('ESCROW_FACTORY_ADDRESS', ''))
+            if args.action == 'count': result = {'count': client.get_factory_escrow_count()}
+            elif args.action == 'show': result = client.get_job(args.job_id)
+            elif args.action == 'create': result = client.post_job(args.job_id, args.worker, args.amount)
+            else: result = client.act(args.job_id, args.action, args.recipient)
         print(json.dumps(result, indent=2))
-        
-        # Get escrow count
-        count = client.get_factory_escrow_count()
-        print(f"\n📊 Total escrows created: {count}")
-        
-    except Exception as e:
-        print(f"❌ Error: {str(e)}")
+    except Exception as exc:
+        parser.exit(1, f'Error: {exc}\n')
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

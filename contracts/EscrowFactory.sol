@@ -4,18 +4,13 @@ pragma solidity ^0.8.20;
 import "./JobEscrow.sol";
 
 contract EscrowFactory {
-    address public owner;
+    address public immutable owner;
     uint256 public escrowCount;
     mapping(uint256 => address) public escrows;
     mapping(uint256 => bool) public jobExists;
     
     event EscrowCreated(uint256 indexed jobId, address indexed escrowAddress, address indexed creator, uint256 amount);
-    event EscrowClosed(uint256 indexed jobId, address escrowAddress);
-    
-    modifier onlyOwner() {
-        require(msg.sender == owner, "Only owner can call this function");
-        _;
-    }
+
     
     constructor() {
         owner = msg.sender;
@@ -45,7 +40,8 @@ contract EscrowFactory {
             _worker,     // worker
             _amount,     // payment amount
             jobId,
-            block.timestamp + 7 days // auto-release deadline
+            block.timestamp + 7 days, // work submission deadline
+            owner // independent arbitrator selected when the factory is deployed
         );
         
         escrows[jobId] = address(escrow);
@@ -82,3 +78,4 @@ contract EscrowFactory {
         return escrowCount;
     }
 }
+
